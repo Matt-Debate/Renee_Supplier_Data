@@ -13,10 +13,9 @@ TEMPLATE_PATH = Path("templates") / "Renee(B).xlsx"
 NY_TZ = ZoneInfo("America/New_York")
 
 
-st.set_page_config(page_title="Renee Supplier Data Transformer", layout="wide")
+st.set_page_config(page_title="Supplier Data Transformer", layout="wide")
 
-st.title("Renee Supplier Data Transformer")
-st.write("Upload the supplier sheet (Spreadsheet A). The app outputs an Excel file in the fixed **Renee(B)** format.")
+st.title("Supplier Data Transformer")
 
 
 with st.sidebar:

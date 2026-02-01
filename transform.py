@@ -1,47 +1,50 @@
 #!/usr/bin/env python3
 """
-Renee(A)->Renee(B) converter
+Renee(A)->Renee(B) converter (hockey sticks only)
 
 What it does
-- Reads Renee(A).xlsx and extracts ONLY the 3 hockey-stick blocks:
+- Reads Spreadsheet A and extracts ONLY the 3 hockey-stick blocks:
     Block 1: B–F  (Model, Blade, Flex, Left, Right)
     Block 2: H–L
     Block 3: N–R
-  Data is expected to start at row 5 with headers on row 4 (as in your files).
+  Data expected to start row 5 with headers row 4.
 
-- Handles merged cells in Model/Blade by using the merged range's top-left value,
+- Handles merged cells in Model/Blade by using merged range top-left value,
   then fill-downs Model/Blade while scanning.
 
 - Defect rule (default ON):
-    If a Left/Right quantity cell contains any non-ASCII characters (commonly Chinese
-    like 瑕疵), that cell is treated as excluded (written as blank/None).
+    If a Left/Right quantity cell contains any non-ASCII characters (often Chinese notes),
+    that cell is excluded (treated as blank).
 
-- Uses Renee(B).xlsx as a fixed template listing the rows/order of output.
-  It fills Left/Right in that template by matching (Model, Blade, Flex).
+- Uses Spreadsheet B as a template and preserves formatting/styles.
+  Adds a Style/Color column between Model and Blade if missing:
+    B: Model
+    C: Style/Color
+    D: Blade
+    E: Flex
+    F: Left
+    G: Right
 
-- Optionally fills down missing Model/Blade cells in the B template (default ON).
+- Extracts a trailing parenthetical suffix from Model (both ASCII and full-width Chinese parentheses):
+    "FT8 Pro (RED)" -> Model="FT8 Pro", Style="RED"
+    "FT6（red,black.blue,green）" -> Model="FT6", Style="red,black.blue,green"
 
-IMPORTANT RELIABILITY CHANGE
-- The B template may contain existing data. To prevent "data leakage", this script
-  clears Left/Right columns for all rows before writing new values.
+- Prevents Style "bleed" across models when template has blank style rows:
+    If a new model begins and style is blank on that row, current_style resets to None.
 
-Outputs
-- A generated .xlsx preserving Renee(B) formatting/styles.
-- Optionally a CSV diff report comparing generated output to the provided B.
+Output
+- Writes a new .xlsx preserving B formatting.
+- Optional CSV diff between original B and generated output.
 
 Usage
-  python transform.py --a "Renee(A).xlsx" --b "Renee(B).xlsx" --out "Renee(B)_generated.xlsx"
-
-Optional
-  --no-defect-exclusion
-  --no-filldown-b-template
-  --diff-csv "diff_report.csv"
+  python transform.py --a "A.xlsx" --b "B.xlsx" --out "out.xlsx"
 """
 
 import argparse
 import math
 import re
 from collections import defaultdict
+from copy import copy as ccopy
 from typing import Any, Dict, Tuple, Optional, List
 
 from openpyxl import load_workbook
@@ -67,6 +70,35 @@ def norm_blade(v: Any) -> Optional[str]:
     s = norm_text(v)
     return s.upper() if s else None
 
+def norm_style(v: Any) -> Optional[str]:
+    s = norm_text(v)
+    return s.upper() if s else None
+
+def split_model_and_style(model_raw: Any) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract trailing parentheses content, supporting both ASCII () and full-width （）.
+
+    Examples:
+      "FT8 Pro (RED)" -> ("FT8 Pro", "RED")
+      "FT6（red,black.blue,green）" -> ("FT6", "red,black.blue,green")
+      "Flylite USA Flag     （Tracer axis）" -> ("Flylite USA Flag", "Tracer axis")
+    """
+    s = norm_model(model_raw)
+    if not s:
+        return None, None
+
+    # Normalize full-width parentheses to ASCII and trim
+    s_norm = s.replace("（", "(").replace("）", ")").strip()
+
+    # Only match a trailing (...) group
+    m = re.match(r"^(.*?)\s*\(([^()]*)\)\s*$", s_norm)
+    if not m:
+        return s_norm, None
+
+    base = (m.group(1) or "").strip() or s_norm
+    style = (m.group(2) or "").strip() or None
+    return base, style
+
 def parse_flex(v: Any) -> Optional[int]:
     if v is None:
         return None
@@ -81,7 +113,7 @@ def parse_flex(v: Any) -> Optional[int]:
 
 def parse_qty(v: Any, defect_exclusion: bool = True) -> Optional[int]:
     """
-    Quantity parsing.
+    Quantity parsing:
     - numeric -> int
     - string with digits -> int(digits)
     - if defect_exclusion and string contains non-ascii -> excluded (None)
@@ -121,25 +153,72 @@ def merged_top_left_value(ws, cell) -> Any:
 
 
 # -----------------------------
+# Ensure Style/Color column exists in B
+# -----------------------------
+
+def ensure_style_column(ws) -> None:
+    """
+    Ensures there is a Style/Color column inserted between Model and Blade.
+
+    Original template:
+      B: Model, C: Blade, D: Flex, E: Left, F: Right
+
+    After:
+      B: Model, C: Style/Color, D: Blade, E: Flex, F: Left, G: Right
+    """
+    header_c = ws.cell(1, 3).value
+    header_c_s = str(header_c).strip().lower() if header_c is not None else ""
+
+    # If column C already looks like style/color, do nothing
+    if "style" in header_c_s or "color" in header_c_s:
+        return
+
+    # Preserve old column C width if set
+    old_c_dim = ws.column_dimensions.get("C", None)
+    old_c_width = old_c_dim.width if old_c_dim else None
+
+    # Insert new column C
+    ws.insert_cols(3)
+    ws.cell(1, 3).value = "Style/Color"
+
+    # Copy formatting from column B into the new column C
+    max_row = ws.max_row
+    for r in range(1, max_row + 1):
+        src = ws.cell(r, 2)  # B
+        dst = ws.cell(r, 3)  # new C
+        dst.font = ccopy(src.font)
+        dst.fill = ccopy(src.fill)
+        dst.border = ccopy(src.border)
+        dst.alignment = ccopy(src.alignment)
+        dst.number_format = src.number_format
+        dst.protection = ccopy(src.protection)
+
+    if old_c_width is not None:
+        ws.column_dimensions["C"].width = old_c_width
+
+
+# -----------------------------
 # Extract inventory from A
 # -----------------------------
 
-def build_inventory_from_a(path_a: str, defect_exclusion: bool = True) -> Dict[Tuple[str, str, int], Tuple[Optional[int], Optional[int]]]:
+def build_inventory_from_a(
+    path_a: str,
+    defect_exclusion: bool = True
+) -> Dict[Tuple[str, Optional[str], str, int], Tuple[Optional[int], Optional[int]]]:
     wb_a = load_workbook(path_a, data_only=True)
     ws_a = wb_a.active
 
-    # Fixed stick blocks
     blocks = [
-        {"model_col": 2, "blade_col": 3, "flex_col": 4, "left_col": 5, "right_col": 6},       # B-F
-        {"model_col": 8, "blade_col": 9, "flex_col": 10, "left_col": 11, "right_col": 12},    # H-L
-        {"model_col": 14, "blade_col": 15, "flex_col": 16, "left_col": 17, "right_col": 18},  # N-R
+        {"model_col": 2,  "blade_col": 3,  "flex_col": 4,  "left_col": 5,  "right_col": 6},    # B-F
+        {"model_col": 8,  "blade_col": 9,  "flex_col": 10, "left_col": 11, "right_col": 12},   # H-L
+        {"model_col": 14, "blade_col": 15, "flex_col": 16, "left_col": 17, "right_col": 18},   # N-R
     ]
 
     summed = defaultdict(lambda: {"L": 0, "R": 0})
 
     for blk in blocks:
-        current_model = None
-        current_blade = None
+        current_model_raw = None
+        current_blade_raw = None
 
         for r in range(5, ws_a.max_row + 1):
             model_v = merged_top_left_value(ws_a, ws_a.cell(r, blk["model_col"]))
@@ -148,32 +227,32 @@ def build_inventory_from_a(path_a: str, defect_exclusion: bool = True) -> Dict[T
             left_v  = ws_a.cell(r, blk["left_col"]).value
             right_v = ws_a.cell(r, blk["right_col"]).value
 
-            model_here = norm_model(model_v)
-            blade_here = norm_blade(blade_v)
+            if norm_model(model_v):
+                current_model_raw = model_v
+            if norm_blade(blade_v):
+                current_blade_raw = blade_v
 
-            if model_here:
-                current_model = model_here
-            if blade_here:
-                current_blade = blade_here
+            model_use = model_v if norm_model(model_v) else current_model_raw
+            blade_use = blade_v if norm_blade(blade_v) else current_blade_raw
 
-            model = model_here or current_model
-            blade = blade_here or current_blade
+            model_base, style = split_model_and_style(model_use)
+            style = norm_style(style)
+            blade = norm_blade(blade_use)
             flex = parse_flex(flex_v)
 
-            if model is None or blade is None or flex is None:
+            if model_base is None or blade is None or flex is None:
                 continue
 
             L = parse_qty(left_v, defect_exclusion=defect_exclusion)
             R = parse_qty(right_v, defect_exclusion=defect_exclusion)
 
-            key = (model, blade, flex)
+            key = (model_base, style, blade, flex)
             if L is not None:
                 summed[key]["L"] += L
             if R is not None:
                 summed[key]["R"] += R
 
-    # Convert 0 totals to None (blank)
-    inv: Dict[Tuple[str, str, int], Tuple[Optional[int], Optional[int]]] = {}
+    inv: Dict[Tuple[str, Optional[str], str, int], Tuple[Optional[int], Optional[int]]] = {}
     for k, v in summed.items():
         L = v["L"] if v["L"] > 0 else None
         R = v["R"] if v["R"] > 0 else None
@@ -186,25 +265,28 @@ def build_inventory_from_a(path_a: str, defect_exclusion: bool = True) -> Dict[T
 # Apply inventory to B template
 # -----------------------------
 
-def apply_to_b_template(path_b: str,
-                        out_path: str,
-                        inv: Dict[Tuple[str, str, int], Tuple[Optional[int], Optional[int]]],
-                        filldown_b_template: bool = True) -> None:
-    """
-    Writes a new file at out_path, preserving B formatting/styles.
-    Assumes B uses columns:
-        B: Model, C: Blade, D: Flex, E: Left, F: Right
-    Header at row 1; data from row 2 down.
-
-    Reliability:
-    - Clears E/F for all rows before filling so existing template data never leaks through.
-    """
-    wb_out = load_workbook(path_b)  # keep styles
+def apply_to_b_template(
+    path_b: str,
+    out_path: str,
+    inv: Dict[Tuple[str, Optional[str], str, int], Tuple[Optional[int], Optional[int]]],
+    filldown_b_template: bool = True
+) -> None:
+    wb_out = load_workbook(path_b)  # preserve styles
     ws = wb_out.active
 
-    # Find last non-empty row in B for columns B-F
+    ensure_style_column(ws)
+
+    # After ensure_style_column, columns are:
+    # B Model, C Style, D Blade, E Flex, F Left, G Right
+    COL_MODEL = 2
+    COL_STYLE = 3
+    COL_BLADE = 4
+    COL_FLEX  = 5
+    COL_LEFT  = 6
+    COL_RIGHT = 7
+
     def row_has_any(r: int) -> bool:
-        for c in (2, 3, 4, 5, 6):
+        for c in (COL_MODEL, COL_STYLE, COL_BLADE, COL_FLEX, COL_LEFT, COL_RIGHT):
             v = ws.cell(r, c).value
             if v not in (None, ""):
                 return True
@@ -214,44 +296,63 @@ def apply_to_b_template(path_b: str,
     while last_row > 1 and not row_has_any(last_row):
         last_row -= 1
 
-    # ---- CLEAR PASS (prevents data leakage from templates that already contain quantities) ----
+    # Clear Left/Right to avoid template values leaking
     for r in range(2, last_row + 1):
-        ws.cell(r, 5).value = None  # Left
-        ws.cell(r, 6).value = None  # Right
+        ws.cell(r, COL_LEFT).value = None
+        ws.cell(r, COL_RIGHT).value = None
 
-    current_model = None
-    current_blade = None
+    current_model: Optional[str] = None
+    current_style: Optional[str] = None
+    current_blade: Optional[str] = None
 
     for r in range(2, last_row + 1):
-        model_cell = ws.cell(r, 2)
-        blade_cell = ws.cell(r, 3)
-        flex_cell  = ws.cell(r, 4)
-        left_cell  = ws.cell(r, 5)
-        right_cell = ws.cell(r, 6)
+        model_cell = ws.cell(r, COL_MODEL)
+        style_cell = ws.cell(r, COL_STYLE)
+        blade_cell = ws.cell(r, COL_BLADE)
+        flex_cell  = ws.cell(r, COL_FLEX)
+        left_cell  = ws.cell(r, COL_LEFT)
+        right_cell = ws.cell(r, COL_RIGHT)
 
-        model_here = norm_model(model_cell.value)
+        # Read model/style, allowing older templates that had "Model (STYLE)" in column B
+        base_model_here, style_from_model = split_model_and_style(model_cell.value)
+        style_here = norm_style(style_cell.value) or norm_style(style_from_model)
         blade_here = norm_blade(blade_cell.value)
         flex = parse_flex(flex_cell.value)
 
-        if model_here:
-            current_model = model_here
+        # If we extracted trailing parentheses from Model cell, rewrite it to base model
+        if base_model_here and style_from_model:
+            model_cell.value = base_model_here
+
+        # IMPORTANT: stop style bleeding across models
+        model_changed = base_model_here is not None and base_model_here != current_model
+        if model_changed and not style_here:
+            current_style = None
+
+        # Update current tracking
+        if base_model_here:
+            current_model = base_model_here
+        if style_here:
+            current_style = style_here
         if blade_here:
             current_blade = blade_here
 
-        model = model_here or (current_model if filldown_b_template else None)
+        # Fill down within template if requested
+        model = base_model_here or (current_model if filldown_b_template else None)
+        style = style_here or (current_style if filldown_b_template else None)
         blade = blade_here or (current_blade if filldown_b_template else None)
 
-        # Optional: fix blank model/blade cells by filling them in
         if filldown_b_template:
             if (model_cell.value is None or str(model_cell.value).strip() == "") and model:
                 model_cell.value = model
+            if (style_cell.value is None or str(style_cell.value).strip() == "") and style:
+                style_cell.value = style
             if (blade_cell.value is None or str(blade_cell.value).strip() == "") and blade:
                 blade_cell.value = blade
 
         if model is None or blade is None or flex is None:
             continue
 
-        key = (model, blade, flex)
+        key = (model, style, blade, flex)
         newL, newR = inv.get(key, (None, None))
 
         left_cell.value = newL
@@ -265,9 +366,6 @@ def apply_to_b_template(path_b: str,
 # -----------------------------
 
 def write_diff_csv(path_b_original: str, path_b_generated: str, diff_csv: str) -> None:
-    """
-    Compares values in B-F between original and generated and writes a CSV of cell diffs.
-    """
     import csv
 
     wb_o = load_workbook(path_b_original, data_only=True)
@@ -275,24 +373,32 @@ def write_diff_csv(path_b_original: str, path_b_generated: str, diff_csv: str) -
     ws_o = wb_o.active
     ws_g = wb_g.active
 
-    # Find last row based on original
-    last_row = ws_o.max_row
+    # Normalize structure so comparisons line up
+    ensure_style_column(ws_o)
+    ensure_style_column(ws_g)
+
+    cols = [
+        (2, "Model"),
+        (3, "Style/Color"),
+        (4, "Blade"),
+        (5, "Flex"),
+        (6, "Left"),
+        (7, "Right"),
+    ]
 
     def row_has_any(ws, r: int) -> bool:
-        return any(ws.cell(r, c).value not in (None, "") for c in (2, 3, 4, 5, 6))
+        return any(ws.cell(r, c).value not in (None, "") for c, _ in cols)
 
+    last_row = ws_o.max_row
     while last_row > 1 and not row_has_any(ws_o, last_row):
         last_row -= 1
 
-    cols = [(2, "Model"), (3, "Blade"), (4, "Flex"), (5, "Left"), (6, "Right")]
     diffs: List[Dict[str, Any]] = []
-
     for r in range(1, last_row + 1):
         for c, name in cols:
             o = ws_o.cell(r, c).value
             g = ws_g.cell(r, c).value
 
-            # Treat None and "" as equivalent blanks
             o_blank = (o is None) or (isinstance(o, str) and o.strip() == "")
             g_blank = (g is None) or (isinstance(g, str) and g.strip() == "")
             if o_blank and g_blank:
@@ -311,12 +417,14 @@ def write_diff_csv(path_b_original: str, path_b_generated: str, diff_csv: str) -
 # Public API for Streamlit
 # -----------------------------
 
-def transform_files(path_a: str,
-                    path_b: str,
-                    out_path: str,
-                    defect_exclusion: bool = True,
-                    filldown_b_template: bool = True,
-                    diff_csv: str | None = None) -> None:
+def transform_files(
+    path_a: str,
+    path_b: str,
+    out_path: str,
+    defect_exclusion: bool = True,
+    filldown_b_template: bool = True,
+    diff_csv: Optional[str] = None
+) -> None:
     inv = build_inventory_from_a(path_a, defect_exclusion=defect_exclusion)
     apply_to_b_template(path_b, out_path, inv, filldown_b_template=filldown_b_template)
     if diff_csv:
@@ -329,13 +437,13 @@ def transform_files(path_a: str,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--a", required=True, help="Path to Renee(A).xlsx")
-    ap.add_argument("--b", required=True, help="Path to Renee(B).xlsx (template)")
-    ap.add_argument("--out", required=True, help="Output path for generated B")
+    ap.add_argument("--a", required=True, help="Path to Spreadsheet A (.xlsx)")
+    ap.add_argument("--b", required=True, help="Path to Spreadsheet B template (.xlsx)")
+    ap.add_argument("--out", required=True, help="Output path for generated .xlsx")
     ap.add_argument("--no-defect-exclusion", action="store_true",
                     help="If set, quantities with Chinese/non-ascii annotations will NOT be excluded.")
     ap.add_argument("--no-filldown-b-template", action="store_true",
-                    help="If set, do NOT fill down blank Model/Blade cells inside B template.")
+                    help="If set, do NOT fill down blank cells inside B template.")
     ap.add_argument("--diff-csv", default=None,
                     help="Optional path to write a CSV diff report comparing provided B vs generated output.")
 
@@ -349,7 +457,6 @@ def main():
         filldown_b_template=(not args.no_filldown_b_template),
         diff_csv=args.diff_csv,
     )
-
 
 if __name__ == "__main__":
     main()
